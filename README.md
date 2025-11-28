@@ -49,6 +49,8 @@ python3 scripts/calc_depositor_fees.py <depositor-address>
 python3 scripts/calc_depositor_fees.py 0x93A62dA5a14C80f265DAbC077fCEE437B1a0Efde
 ```
 
+The script now validates that the performance fee stays constant across the depositor's entire history and that the management fee remains zero. It samples five even-spaced blocks between the first and last event, checks the fee configuration via the accountant contract, and stops with a clear error if anything changed so you can trust the rest of the calculation.
+
 **Output includes:**
 - Complete list of deposits, withdrawals, and transfers
 - Current position (shares and value)
@@ -58,7 +60,7 @@ python3 scripts/calc_depositor_fees.py 0x93A62dA5a14C80f265DAbC077fCEE437B1a0Efd
 - Debugging information for fee calculation verification
 
 **Environment Variables:**
-- `ENVIO_GRAPHQL_URL` - GraphQL endpoint (default: `http://localhost:8080/graphql`)
+- `ENVIO_GRAPHQL_URL` - GraphQL endpoint (default: `http://localhost:8080/v1/graphql`)
 - `ENVIO_PASSWORD` - GraphQL password (default: `testing`)
 - `RPC_URL` - Ethereum RPC endpoint for current state queries (default: `https://eth.merkle.io`)
 

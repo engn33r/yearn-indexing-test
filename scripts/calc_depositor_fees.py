@@ -406,30 +406,87 @@ def calculate_weighted_average_entry_pps(events: List[Event], decimals: int) -> 
     return total_assets * 1000000 // total_shares
 
 
-def get_performance_fee_rate(vault_address: str) -> int:
+def read_accountant_fee_config(vault_address: str, block_number: Optional[int] = None) -> Tuple[int, int, int, int]:
+    accountant_hex = contract_call(vault_address, '0x4fb3ccc5', block_number)
+    accountant_address = '0x' + accountant_hex[-40:]
+    selector = '0xde1eb9a3'
+    vault_param = vault_address.lower().replace('0x', '').rjust(64, '0')
+    config_hex = contract_call(accountant_address, selector + vault_param, block_number)
+    if not config_hex:
+        raise RuntimeError('Empty getVaultConfig response')
+    hex_payload = (config_hex[2:] if config_hex.startswith('0x') else config_hex).ljust(64 * 4, '0')
+    if len(hex_payload) < 64 * 4:
+        raise RuntimeError(f'getVaultConfig returned {len(hex_payload)} hex characters')
+    words = [int(hex_payload[i * 64:(i + 1) * 64], 16) for i in range(4)]
+    return tuple(words)  # management_fee, performance_fee, _, max_fee
+
+
+def verify_management_fee_zero(vault_address: str, blocks: List[int]) -> None:
+    for block in blocks:
+        management_fee, _, _, _ = read_accountant_fee_config(vault_address, block)
+        if management_fee != 0:
+            raise RuntimeError(
+                f'Management fee non-zero ({management_fee}) detected at block {block}; expected 0'
+            )
+
+
+def get_performance_fee_rate(vault_address: str, block_number: Optional[int] = None, *, log: bool = True) -> int:
     try:
-        accountant_hex = contract_call(vault_address, '0x4fb3ccc5')
-        accountant_address = '0x' + accountant_hex[-40:]
-        selector = '0xde1eb9a3'
-        vault_param = vault_address.lower().replace('0x', '').rjust(64, '0')
-        config_hex = contract_call(accountant_address, selector + vault_param)
-        if not config_hex:
-            raise RuntimeError('Empty getVaultConfig response')
-        hex_payload = (config_hex[2:] if config_hex.startswith('0x') else config_hex).ljust(64 * 4, '0')
-        if len(hex_payload) < 64 * 4:
-            raise RuntimeError(f'getVaultConfig returned {len(hex_payload)} hex characters')
-        words = [int(hex_payload[i * 64:(i + 1) * 64], 16) for i in range(4)]
-        management_fee, performance_fee, _, max_fee = words
+        management_fee, performance_fee, _, max_fee = read_accountant_fee_config(vault_address, block_number)
         if management_fee != 0:
             raise RuntimeError(f'Unexpected management fee {management_fee} (expected 0)')
         if max_fee == 0:
             raise RuntimeError('maxFee is zero')
         ratio_bps = performance_fee * 10000 // max_fee
-        print(f'Performance fee {ratio_bps / 100}% (calculated from on-chain)')
+        if log:
+            print(f'Performance fee {ratio_bps / 100}% (calculated from on-chain)')
         return ratio_bps
     except Exception as exc:
         print(f'Warning: could not fetch performance fee rate ({exc}) – using default 10%')
         return 1000
+
+
+def sample_fee_check_blocks(start_block: int, end_block: int, checks: int = 5) -> List[int]:
+    if checks <= 1 or start_block == end_block:
+        return [start_block] * checks
+
+    span = end_block - start_block
+    if span <= 0:
+        return [start_block] * checks
+
+    return [start_block + (span * i) // (checks - 1) for i in range(checks)]
+
+
+def verify_performance_fee_stability(
+    vault_address: str,
+    first_block: Optional[int],
+    last_block: Optional[int],
+    reference_fee_bps: int,
+    checks: int = 5,
+    *,
+    blocks_to_check: Optional[List[int]] = None,
+) -> List[int]:
+    if first_block is None or last_block is None:
+        return []
+    if checks <= 0:
+        return []
+
+    if blocks_to_check is None:
+        blocks_to_check = sample_fee_check_blocks(first_block, last_block, checks)
+    observed = []
+    for block in blocks_to_check:
+        fee = get_performance_fee_rate(vault_address, block, log=False)
+        observed.append((block, fee))
+
+    if any(fee != reference_fee_bps for _, fee in observed):
+        details = ', '.join(
+            f'Block {block}: {fee / 100:.2f}%' for block, fee in observed
+        )
+        raise RuntimeError(
+            f'Performance fee changed during depositor activity; expected '
+            f'{reference_fee_bps / 100:.2f}%, observed [{details}]'
+        )
+    return blocks_to_check
 
 
 def calculate_incremental_profit_and_fees(
@@ -715,6 +772,13 @@ def main() -> None:
         depositor_address,
     )
 
+    if position.snapshots:
+        first_event_block = position.snapshots[0].block_number
+        last_event_block = position.snapshots[-1].block_number
+    else:
+        first_event_block = None
+        last_event_block = None
+
     print('Fetching current vault state...')
     price_per_share_hex = contract_call(VAULT_ADDRESS, PRICE_PER_SHARE_SELECTOR)
     decimals_hex = contract_call(VAULT_ADDRESS, DECIMALS_SELECTOR)
@@ -724,6 +788,18 @@ def main() -> None:
 
     print('Fetching performance fee rate...')
     performance_fee_bps = get_performance_fee_rate(VAULT_ADDRESS)
+    if first_event_block is not None and last_event_block is not None:
+        blocks_to_check = sample_fee_check_blocks(first_event_block, last_event_block)
+        print(f'Verifying performance fee stability throughout depositor history ({len(blocks_to_check)} datapoints)...')
+        verify_performance_fee_stability(
+            VAULT_ADDRESS,
+            first_event_block,
+            last_event_block,
+            performance_fee_bps,
+            blocks_to_check=blocks_to_check,
+        )
+        print(f'Verifying management fee remains zero throughout depositor history ({len(blocks_to_check)} datapoints)...')
+        verify_management_fee_zero(VAULT_ADDRESS, blocks_to_check)
     weighted_avg_entry_pps = calculate_weighted_average_entry_pps(position.user_events, decimals)
     profit_and_fees = calculate_incremental_profit_and_fees(
         position.snapshots,
