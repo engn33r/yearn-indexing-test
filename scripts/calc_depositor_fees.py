@@ -536,7 +536,12 @@ def sample_series(series: List[Dict[str, int]], max_points: int) -> List[Dict[st
     return sampled
 
 
-def prepare_balance_profit_series(snapshots: List[PositionSnapshot], decimals: int) -> List[Dict[str, int]]:
+def prepare_balance_profit_series(
+    snapshots: List[PositionSnapshot],
+    decimals: int,
+    current_pps: int,
+    current_shares: int,
+) -> List[Dict[str, int]]:
     if not snapshots:
         return []
     scale = 10 ** decimals
@@ -557,16 +562,39 @@ def prepare_balance_profit_series(snapshots: List[PositionSnapshot], decimals: i
             'profit': profit,
         })
 
+    # Add profit from last snapshot to current state
+    profit += previous_shares * (current_pps - previous_pps) // scale
+
+    # Add current state as final data point
+    # Fetch current block number
+    try:
+        current_block_hex = rpc_call('eth_blockNumber', [])
+        current_block = int(current_block_hex, 16)
+    except Exception:
+        # If RPC call fails, use last snapshot block + offset as approximation
+        current_block = snapshots[-1].block_number + 1000
+
+    series.append({
+        'block': current_block,
+        'shares': current_shares,
+        'profit': profit,
+    })
+
     return series
 
 
-def plot_balance_profit(snapshots: List[PositionSnapshot], decimals: int) -> None:
+def plot_balance_profit(
+    snapshots: List[PositionSnapshot],
+    decimals: int,
+    current_pps: int,
+    current_shares: int,
+) -> None:
     if not snapshots:
         return
     if not HAS_MATPLOTLIB:  # pragma: no cover
         print('Install matplotlib (`pip install matplotlib`) to see the popup plot.')
         return
-    series = prepare_balance_profit_series(snapshots, decimals)
+    series = prepare_balance_profit_series(snapshots, decimals, current_pps, current_shares)
     graph_series = sample_series(series, 300)
     blocks = [point['block'] for point in graph_series]
     shares = [point['shares'] / 1_000_000 for point in graph_series]
@@ -588,24 +616,41 @@ def plot_balance_profit(snapshots: List[PositionSnapshot], decimals: int) -> Non
     ax.grid(alpha=0.3)
 
     dates = [get_block_timestamp(block) for block in blocks]
-    year_ticks: List[Tuple[int, int]] = []
-    current_year: Optional[int] = None
-    for block, date in zip(blocks, dates):
-        year = date.year
-        if current_year is None or year != current_year:
-            year_ticks.append((block, year))
-            current_year = year
 
-    if year_ticks:
+    # Create top x-axis with start and end dates
+    if dates:
+        start_date = dates[0].strftime('%d/%m/%Y')
+        end_date = dates[-1].strftime('%d/%m/%Y')
+
         ax_dates = ax.twiny()
         ax_dates.set_xlim(ax.get_xlim())
-        ax_dates.set_xticks([block for block, _ in year_ticks])
-        ax_dates.set_xticklabels([str(year) for _, year in year_ticks])
-        ax_dates.set_xlabel('Year')
+
+        # Show start and end dates at the edges
+        tick_positions = [blocks[0], blocks[-1]]
+        tick_labels = [f'Start: {start_date}', f'End: {end_date}']
+
+        # Add year markers if span crosses multiple years
+        year_ticks: List[Tuple[int, str]] = []
+        current_year: Optional[int] = None
+        for block, date in zip(blocks, dates):
+            year = date.year
+            if current_year is None or year != current_year:
+                # Don't add year tick if it's too close to start or end
+                if block != blocks[0] and block != blocks[-1]:
+                    year_ticks.append((block, str(year)))
+                current_year = year
+
+        if year_ticks:
+            tick_positions.extend([block for block, _ in year_ticks])
+            tick_labels.extend([year for _, year in year_ticks])
+
+        ax_dates.set_xticks(tick_positions)
+        ax_dates.set_xticklabels(tick_labels)
+        ax_dates.set_xlabel('Date Range')
         ax_dates.xaxis.set_label_position('top')
         ax_dates.xaxis.set_ticks_position('top')
         ax_dates.spines['top'].set_position(('outward', 36))
-        ax_dates.tick_params(axis='x', labelrotation=0)
+        ax_dates.tick_params(axis='x', labelrotation=15, labelsize=9)
 
     ax2 = ax.twinx()
     profit_line, = ax2.plot(blocks, profits, label='Incremental profit (USDC)', color='tab:green')
@@ -747,17 +792,30 @@ def format_output(
 
     print('\n' + '=' * 80)
 
-    plot_balance_profit(position.snapshots, decimals)
+    plot_balance_profit(position.snapshots, decimals, current_pps, current_shares)
 
 
 
 def main() -> None:
     args = sys.argv[1:]
     if not args:
-        print('Usage: python3 scripts/calc_depositor_fees.py <depositor-address>')
+        print('Usage: python3 scripts/calc_depositor_fees.py <depositor-address> [--stable-fees]')
         sys.exit(1)
-    depositor_address = args[0]
-    if not depositor_address.startswith('0x') or len(depositor_address) != 42:
+
+    # Parse arguments
+    depositor_address = None
+    check_stable_fees = False
+
+    for arg in args:
+        if arg == '--stable-fees':
+            check_stable_fees = True
+        elif arg.startswith('0x'):
+            depositor_address = arg
+
+    if not depositor_address:
+        print('Error: Depositor address is required')
+        sys.exit(1)
+    if len(depositor_address) != 42:
         print('Error: Invalid Ethereum address format')
         sys.exit(1)
 
@@ -788,7 +846,7 @@ def main() -> None:
 
     print('Fetching performance fee rate...')
     performance_fee_bps = get_performance_fee_rate(VAULT_ADDRESS)
-    if first_event_block is not None and last_event_block is not None:
+    if check_stable_fees and first_event_block is not None and last_event_block is not None:
         blocks_to_check = sample_fee_check_blocks(first_event_block, last_event_block)
         print(f'Verifying performance fee stability throughout depositor history ({len(blocks_to_check)} datapoints)...')
         verify_performance_fee_stability(

@@ -35,3 +35,14 @@ query MyQuery {
     }
   }
 ```
+
+To see all unique depositor addresses
+```
+query GetUniqueDepositors {
+    Deposit(distinct_on: owner, order_by: { owner: asc }) {
+      owner
+    }
+  }
+```
+
+
