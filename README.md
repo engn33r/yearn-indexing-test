@@ -69,3 +69,4 @@ The script now validates that the performance fee stays constant across the depo
 ```bash
 pnpm codegen
 ```
+
